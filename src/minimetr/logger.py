@@ -128,7 +128,7 @@ class Logger:
             )
             self._session_id = cursor.fetchone()[0]
             conn.commit()
-            print(f"[Main] Initialized DB and created session_id: {self._session_id}")
+            # print(f"[Main] Initialized DB and created session_id: {self._session_id}")
             conn.close()
         except sqlite3.Error as e:
             print(f"Database error during initialization: {e}")
@@ -235,7 +235,7 @@ class Logger:
         if not metrics_dict:  # Prevent writing empty DataPoints rows
             return
 
-        print(f"[Worker] Processing step: {step_tuple}, {len(metrics_dict)} metrics")
+        # print(f"[Worker] Processing step: {step_tuple}, {len(metrics_dict)} metrics")
         cursor = conn.cursor()
         try:
             # 1. Get Step ID
@@ -270,7 +270,7 @@ class Logger:
                 (step_id, metric_set_id, values_blob),
             )
             conn.commit()  # Commit transaction for this step
-            print(f"[Worker] Inserted datapoint for step_id {step_id}")
+            # print(f"[Worker] Inserted datapoint for step_id {step_id}")
         except sqlite3.Error as e:
             print(f"[Worker] Database error processing step {step_tuple}: {e}")
             conn.rollback()  # Rollback on error for this step
@@ -284,7 +284,7 @@ class Logger:
             self._db_path, check_same_thread=False, timeout=10.0
         )  # Longer timeout
         conn.execute("PRAGMA journal_mode=WAL;")
-        print("[Worker] Started")
+        # print("[Worker] Started")
 
         while True:
             item = None  # Ensure item is defined for finally block
@@ -302,7 +302,7 @@ class Logger:
                     payload = item[1]
 
                     if command == "STOP":
-                        print("[Worker] STOP command received.")
+                        # print("[Worker] STOP command received.")
                         break  # Exit loop -> finally will call task_done
                     elif command == "FLUSH":
                         step_tuple = payload
@@ -346,7 +346,7 @@ class Logger:
             pass
 
         conn.close()
-        print("[Worker] Stopped")
+        # print("[Worker] Stopped")
 
     def log(self, step_def: Dict[str, Any], value: float, **metric_def):
         """Logs a single metric value for a given step context."""
@@ -402,7 +402,6 @@ class Logger:
             if metrics_to_flush:  # Only queue if buffer wasn't empty
                 # Put ('FLUSH', tuple, metrics_dict) command
                 self._write_queue.put(("FLUSH", step_tuple, metrics_to_flush))
-                print(f"[Main] Queued flush for step: {step_tuple}")
             # else: Buffer existed but was empty, do nothing
         # else: step_tuple not in buffer (already flushed or never used)
 
@@ -422,16 +421,11 @@ class Logger:
                 # Clear active step if it was the one explicitly flushed
                 if target_tuple == self._active_step_tuple:
                     self._active_step_tuple = None
-            else:
-                print(
-                    "[Main] Flush called with no active step and no specific step provided."
-                )
 
     def close(self):
         """Flushes all remaining buffers and shuts down the writer thread gracefully."""
         if self._closed:
             return
-        print("[Main] Logger closing...")
         self._closed = True  # Prevent new logs/steps
 
         with self._lock:
@@ -445,16 +439,13 @@ class Logger:
 
         # Signal worker to stop and wait for queue to empty and thread to finish
         if self._worker_thread:
-            print("[Main] Signaling worker thread to stop...")
             self._write_queue.put(("STOP", None))
             self._write_queue.join()  # Wait for all tasks to be marked done
             self._worker_thread.join()  # Wait for thread to terminate
-            print("[Main] Worker thread joined.")
 
         # Unregister from atexit
         if id(self) in _active_loggers:
             del _active_loggers[id(self)]
-        print("[Main] Logger closed.")
 
     def __enter__(self):
         return self
@@ -472,11 +463,13 @@ class Step:
         self._step_def = step_def
         # Keep tuple for potential use in __del__ but primarily pass dict to flush
         self._step_def_tuple = logger._dict_to_tuple(step_def)
+        self._dirty = False
 
     def log(self, value: float, **metric_def):
         """Logs a metric for this specific step context."""
         logger = self._logger_ref()
         if logger and not logger._closed:
+            self._dirty = True
             logger.log(self._step_def, value, **metric_def)
         elif not logger:
             print("[Warning][Step] Logger already garbage collected. Cannot log.")
@@ -486,6 +479,7 @@ class Step:
         """Flushes data associated with this specific step context."""
         logger = self._logger_ref()
         if logger and not logger._closed:
+            self._dirty = False
             logger.flush(self._step_def)
         elif not logger:
             print("[Warning][Step] Logger already garbage collected. Cannot flush.")
@@ -495,19 +489,14 @@ class Step:
         # __del__ is unreliable; using atexit in Logger is preferred for shutdown.
         # This is a best-effort attempt if a Step object is GC'd while logger is active.
         logger = self._logger_ref()
-        if logger and not logger._closed:
+        if self._dirty and logger and not logger._closed:
             # Check buffer directly via lock (might be slow in __del__)
-            needs_flush = False
             with logger._lock:
-                if (
+                needs_flush = (
                     self._step_def_tuple in logger._buffer
                     and logger._buffer[self._step_def_tuple]
-                ):
-                    needs_flush = True
-            if needs_flush:
-                print(
-                    f"[GC][Step] Flushing step {self._step_def} on garbage collection."
                 )
+            if needs_flush:
                 try:
                     # Use the dict version for the public flush method
                     logger.flush(self._step_def)
