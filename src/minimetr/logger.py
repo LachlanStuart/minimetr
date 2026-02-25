@@ -356,12 +356,6 @@ class Logger:
         # print("[Worker] Stopped")
 
     def log(self, step_def: Dict[str, Any], value: float, **metric_def):
-        """Logs a single metric value for a given step context.
-
-        Checks for conflicting keys/values between the session's `run_info`,
-        the provided `step_def`, and the `metric_def`.
-
-        If `auto_flush_on_new_step` is True, calling this with a different `step_def`
         """Logs a single metric value for a given step context."""
         if self._closed:
             raise RuntimeError("Logger is closed.")
