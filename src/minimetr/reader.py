@@ -3,7 +3,14 @@
 import sqlite3
 import json
 import numpy as np
-from typing import Any, Dict, List, Optional, Callable, Tuple, Set
+from typing import Any, Dict, List, Optional, Callable, Tuple, Set, Union
+from collections import namedtuple
+import itertools
+
+# Define the structure for pivot results
+PivotResult = namedtuple(
+    "PivotResult", ["index_tuples", "column_tuples", "values_array"]
+)
 
 
 class Reader:
@@ -87,8 +94,57 @@ class Reader:
         self._keys_cache = None  # Invalidate keys cache
 
     @property
-    def keys(self) -> Dict[str, List[str]]:
-        """Returns a dictionary categorizing all unique keys found across sessions, steps, and metrics."""
+    def session_ids(self) -> List[int]:
+        """Returns a sorted list of all session IDs in the database."""
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT session_id FROM Sessions ORDER BY session_id")
+        return [row["session_id"] for row in cursor.fetchall()]
+
+    def _resolve_session(self, session: Union[int, str, None]) -> Optional[int]:
+        """Resolve a session parameter to a concrete session_id.
+
+        - None: no filtering (returns None)
+        - "latest": resolves to max(session_id)
+        - int: returned as-is
+        """
+        if session is None:
+            return None
+        if session == "latest":
+            ids = self.session_ids
+            if not ids:
+                return None
+            return ids[-1]
+        if isinstance(session, int):
+            return session
+        raise ValueError(f"session must be int, 'latest', or None, got {session!r}")
+
+    @property
+    def keys(self) -> List[str]:
+        """Returns a flat, sorted list of all unique keys found across run_info, steps, and metrics."""
+        categorized = self._get_categorized_keys()
+        all_keys_set: Set[str] = set()
+        for key_list in categorized.values():
+            all_keys_set.update(key_list)
+        return sorted(list(all_keys_set))
+
+    @property
+    def run_keys(self) -> List[str]:
+        """Returns a sorted list of unique keys found in run_info across all sessions."""
+        return self._get_categorized_keys().get("run", [])
+
+    @property
+    def step_keys(self) -> List[str]:
+        """Returns a sorted list of unique keys found in step definitions."""
+        return self._get_categorized_keys().get("step", [])
+
+    @property
+    def metric_keys(self) -> List[str]:
+        """Returns a sorted list of unique keys found in metric definitions."""
+        return self._get_categorized_keys().get("metric", [])
+
+    def _get_categorized_keys(self) -> Dict[str, List[str]]:
+        """Internal helper to get categorized keys, using cache."""
         if self._keys_cache is not None:
             return self._keys_cache
 
@@ -103,29 +159,50 @@ class Reader:
         for run_info in self._session_cache.values():
             keys_by_type["run"].update(run_info.keys())
 
+        step_keys_found = set()
         for step_def in self._step_cache.values():
-            keys_by_type["step"].update(step_def.keys())
-        # Remove any keys that might have been wrongly assigned if present in run_info
-        # keys_by_type['step'] -= keys_by_type['run']
+            step_keys_found.update(step_def.keys())
+        # Assign step keys, ensuring they don't overlap with run keys
+        # (this assumes run keys are less likely to be intentionally shadowed by step keys)
+        keys_by_type["step"] = step_keys_found - keys_by_type["run"]
 
         for metric_def in self._metric_def_cache.values():
-            keys_by_type["metric"].update(metric_def.keys())
+            # Assign metric keys, ensuring they don't overlap with run or step keys
+            keys_by_type["metric"].update(
+                metric_def.keys() - keys_by_type["run"] - keys_by_type["step"]
+            )
 
+        # Final sorted lists
         self._keys_cache = {k: sorted(list(v)) for k, v in keys_by_type.items()}
         return self._keys_cache
 
-    def read(self, **filters) -> List[Dict[str, Any]]:
-        """Reads data points, applying filters across all key types."""
+    def read(self, session: Union[int, str, None] = None, **filters) -> List[Dict[str, Any]]:
+        """Reads data points, applying filters across all key types.
+
+        Args:
+            session: Optional session filter. If "latest", resolves to the most
+                recent session_id. If an int, filters to that session_id. If None
+                (default), reads all sessions.
+            **filters: Key-value or key-callable filters applied to each record.
+        """
         self._load_definitions()  # Ensure definition caches are populated
         conn = self._get_db_connection()
         cursor = conn.cursor()
 
-        # TODO: Optimize filtering - currently loads all then filters in Python
-        # A more performant approach would build dynamic SQL WHERE clauses
-        # based on indexed JSON fields or dedicated columns if performance critical.
-        cursor.execute(
-            "SELECT dp.step_id, dp.definition_set_id, dp.values_blob FROM DataPoints dp"
-        )
+        resolved_session = self._resolve_session(session)
+        if resolved_session is not None:
+            # Filter at the SQL level by JOINing DataPoints with Steps
+            cursor.execute(
+                "SELECT dp.step_id, dp.definition_set_id, dp.values_blob "
+                "FROM DataPoints dp "
+                "JOIN Steps s ON dp.step_id = s.step_id "
+                "WHERE s.session_id = ?",
+                (resolved_session,),
+            )
+        else:
+            cursor.execute(
+                "SELECT dp.step_id, dp.definition_set_id, dp.values_blob FROM DataPoints dp"
+            )
 
         results = []
         lambda_filters = {k: v for k, v in filters.items() if callable(v)}
@@ -144,52 +221,45 @@ class Reader:
             metric_def_ids = self._metric_set_cache.get(def_set_id)
 
             if step_context is None or run_info is None or metric_def_ids is None:
-                print(
-                    f"[Warning] Skipping data point due to missing definition: step_id={step_id}, session_id={session_id}, def_set_id={def_set_id}"
-                )
+                # print(f"[Warning] Skipping data point due to missing definition: step_id={step_id}, session_id={session_id}, def_set_id={def_set_id}")
                 continue
 
             # Decode values blob
-            values = np.frombuffer(values_blob, dtype=np.float32)
-            if len(values) != len(metric_def_ids):
-                print(
-                    f"[Warning] Skipping data point due to value/def mismatch: step_id={step_id}"
-                )
+            try:
+                values = np.frombuffer(values_blob, dtype=np.float32)
+                if len(values) != len(metric_def_ids):
+                    # print(f"[Warning] Skipping data point due to value/def mismatch: step_id={step_id}")
+                    continue
+            except ValueError:
+                # print(f"[Warning] Skipping data point due to blob decoding error: step_id={step_id}")
                 continue
 
             # Combine run_info, step context, metric def, and value
             for i, metric_def_id in enumerate(metric_def_ids):
                 metric_def = self._metric_def_cache.get(metric_def_id)
                 if metric_def is None:
-                    print(
-                        f"[Warning] Skipping metric due to missing metric definition: metric_def_id={metric_def_id}"
-                    )
+                    # print(f"[Warning] Skipping metric due to missing metric definition: metric_def_id={metric_def_id}")
                     continue
 
-                # Create the full record dictionary
-                # Order: value, run_info, step_context, metric_def
                 record = {"value": values[i], **run_info, **step_context, **metric_def}
 
-                # Apply static filters first (cheaper)
+                # Apply filters
                 match = True
+                # Check static first
                 for key, filter_val in static_filters.items():
-                    # Check if key exists in the combined record
-                    if key not in record or record[key] != filter_val:
+                    if record.get(key) != filter_val:  # Use .get for safer check
                         match = False
                         break
                 if not match:
                     continue
-
-                # Apply lambda filters
+                # Check lambda
                 for key, filter_func in lambda_filters.items():
-                    # Check if key exists before applying lambda
                     if key not in record or not filter_func(record[key]):
                         match = False
                         break
                 if not match:
                     continue
 
-                # If all filters passed
                 results.append(record)
 
         return results
@@ -199,13 +269,97 @@ class Reader:
         index: List[str],
         columns: List[str],
         filter: Optional[Dict[str, Any]] = None,
-    ):
-        """Pivots the data."""
-        # TODO: Implement pivot logic using pandas or numpy
-        print(
-            f"[Placeholder] Pivoting data: index={index}, columns={columns}, filter={filter}"
+        session: Union[int, str, None] = None,
+    ) -> PivotResult:
+        """Pivots the data based on specified index and column keys.
+
+        Args:
+            index: List of keys to use for the pivot table index (rows).
+            columns: List of keys to use for the pivot table columns.
+            filter: Optional dictionary of key-value pairs or key-lambda pairs
+                    to filter the data before pivoting.
+            session: Optional session filter (int, "latest", or None).
+
+        Returns:
+            A PivotResult namedtuple containing:
+            - index_tuples: List of unique index tuples (sorted).
+            - column_tuples: List of unique column tuples (sorted).
+            - values_array: Numpy array (float32) with pivoted values (NaN where missing).
+        """
+        data = self.read(session=session, **(filter or {}))
+        if not data:
+            return PivotResult(
+                index_tuples=[],
+                column_tuples=[],
+                values_array=np.array([]).astype(np.float32),
+            )
+
+        # --- Identify unique index and column tuples and create mappings ---
+        index_key_tuples: Set[Tuple] = set()
+        column_key_tuples: Set[Tuple] = set()
+        temp_data_map: Dict[Tuple, Dict[Tuple, float]] = {}
+
+        # Check for missing keys before iterating
+        required_keys = set(index) | set(columns)
+        if data:
+            available_in_data = set(data[0].keys())
+        else:
+            available_in_data = set()
+
+        missing_keys = required_keys - available_in_data
+        if missing_keys:
+            all_available_keys = self.keys
+            raise KeyError(
+                f"Cannot pivot: Key(s) {missing_keys} not found in data. Available keys: {all_available_keys}"
+            )
+
+        for record in data:
+            try:
+                idx_tuple = tuple(record[k] for k in index)
+                col_tuple = tuple(record[k] for k in columns)
+                value = record["value"]
+
+                index_key_tuples.add(idx_tuple)
+                column_key_tuples.add(col_tuple)
+
+                # Store temporarily, handling potential duplicates (e.g., take first)
+                if idx_tuple not in temp_data_map:
+                    temp_data_map[idx_tuple] = {}
+                if (
+                    col_tuple not in temp_data_map[idx_tuple]
+                ):  # Or decide how to aggregate
+                    temp_data_map[idx_tuple][col_tuple] = float(value)  # Ensure float
+            except KeyError as e:
+                # Should be caught by the initial check, but belt-and-suspenders
+                all_available_keys = self.keys
+                raise KeyError(
+                    f"Error accessing key '{e}' during pivot prep. Record: {record}. Available keys: {all_available_keys}"
+                )
+
+        # --- Sort unique tuples and create index/column mappings ---
+        sorted_index_tuples = sorted(list(index_key_tuples))
+        sorted_column_tuples = sorted(list(column_key_tuples))
+
+        index_map = {tuple_val: i for i, tuple_val in enumerate(sorted_index_tuples)}
+        column_map = {tuple_val: j for j, tuple_val in enumerate(sorted_column_tuples)}
+
+        # --- Create and fill the result array ---
+        num_rows = len(sorted_index_tuples)
+        num_cols = len(sorted_column_tuples)
+        values_array = np.full((num_rows, num_cols), np.nan, dtype=np.float32)
+
+        for idx_tuple, col_map_for_idx in temp_data_map.items():
+            row_idx = index_map[idx_tuple]
+            for col_tuple, value in col_map_for_idx.items():
+                if col_tuple in column_map:  # Check if column is actually used
+                    col_idx = column_map[col_tuple]
+                    values_array[row_idx, col_idx] = value
+
+        return PivotResult(
+            index_tuples=sorted_index_tuples,
+            column_tuples=sorted_column_tuples,
+            values_array=values_array,
         )
-        raise NotImplementedError("Pivot functionality not yet implemented.")
 
     def pandas(
         self,
@@ -214,8 +368,13 @@ class Reader:
         filter: Optional[Dict[str, Any]] = None,
         index_formatter: Optional[Callable] = None,
         column_formatter: Optional[Callable] = None,
+        session: Union[int, str, None] = None,
     ):
-        """Returns data as a Pandas DataFrame."""
+        """Returns data as a Pandas DataFrame.
+
+        Args:
+            session: Optional session filter (int, "latest", or None).
+        """
         # TODO: Implement pandas export
         try:
             import pandas as pd
@@ -228,7 +387,7 @@ class Reader:
             f"[Placeholder] Exporting to Pandas: index={index}, columns={columns}, filter={filter}"
         )
         # Basic implementation: Read all matching, then pivot
-        data = self.read(**(filter or {}))
+        data = self.read(session=session, **(filter or {}))
         if not data:
             return pd.DataFrame()  # Return empty DataFrame if no data
 
@@ -270,8 +429,13 @@ class Reader:
         filter: Optional[Dict[str, Any]] = None,
         index_formatter: Optional[Callable] = None,
         column_formatter: Optional[Callable] = None,
+        session: Union[int, str, None] = None,
     ):
-        """Returns data as a Polars DataFrame."""
+        """Returns data as a Polars DataFrame.
+
+        Args:
+            session: Optional session filter (int, "latest", or None).
+        """
         # TODO: Implement polars export (potentially more efficient pivot)
         try:
             import polars as pl
@@ -283,7 +447,7 @@ class Reader:
         print(
             f"[Placeholder] Exporting to Polars: index={index}, columns={columns}, filter={filter}"
         )
-        data = self.read(**(filter or {}))
+        data = self.read(session=session, **(filter or {}))
         if not data:
             return pl.DataFrame()  # Return empty DataFrame if no data
 
@@ -299,10 +463,9 @@ class Reader:
                     f"Cannot pivot: Key(s) {missing_keys} not found in data columns {df.columns}. Ensure index/columns keys exist in run_info, step, or metric definitions."
                 )
 
-            pivot_df = df.pivot(values="value", index=index, columns=columns)
+            # Use "on" instead of deprecated "columns"
+            pivot_df = df.pivot(values="value", index=index, on=columns)
 
-            # Polars doesn't easily support multi-index formatters like pandas
-            # Users might need to handle renaming columns post-pivot if needed
             if column_formatter:
                 print(
                     "[Warning] Polars column_formatter is not directly applied during pivot. Manual renaming might be needed."
