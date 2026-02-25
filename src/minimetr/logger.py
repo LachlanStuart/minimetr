@@ -314,8 +314,8 @@ class Logger:
                         # print("[Worker] STOP command received.")
                         break  # Exit loop -> finally will call task_done
                     elif command == "FLUSH":
-                        step_tuple = payload[0]
-                        metrics_to_flush = payload[1]
+                        step_tuple = item[1]
+                        metrics_to_flush = item[2]
                         if metrics_to_flush:  # Only process if there's actually data
                             self._process_log_command(
                                 conn, self._session_id, step_tuple, metrics_to_flush
